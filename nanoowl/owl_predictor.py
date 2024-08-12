@@ -14,35 +14,32 @@
 # limitations under the License.
 
 
-import torch
-import numpy as np
-import PIL.Image
+import os
 import subprocess
 import tempfile
-import os
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
+
+import numpy as np
+import PIL.Image
+import torch
 from torchvision.ops import roi_align
 from transformers.models.owlvit.modeling_owlvit import OwlViTForObjectDetection
 from transformers.models.owlvit.processing_owlvit import OwlViTProcessor
-from dataclasses import dataclass
-from typing import List, Optional, Union, Tuple
+
 from .image_preprocessor import ImagePreprocessor
 
-__all__ = [
-    "OwlPredictor",
-    "OwlEncodeTextOutput",
-    "OwlEncodeImageOutput",
-    "OwlDecodeOutput"
-]
+__all__ = ["OwlPredictor", "OwlEncodeTextOutput", "OwlEncodeImageOutput", "OwlDecodeOutput"]
 
 
 def _owl_center_to_corners_format_torch(bboxes_center):
     center_x, center_y, width, height = bboxes_center.unbind(-1)
     bbox_corners = torch.stack(
         [
-            (center_x - 0.5 * width), 
-            (center_y - 0.5 * height), 
-            (center_x + 0.5 * width), 
-            (center_y + 0.5 * height)
+            (center_x - 0.5 * width),
+            (center_y - 0.5 * height),
+            (center_x + 0.5 * width),
+            (center_y + 0.5 * height),
         ],
         dim=-1,
     )
@@ -76,7 +73,8 @@ def _owl_get_patch_size(hf_name: str):
 # SPDX-License-Identifier: Apache-2.0
 def _owl_normalize_grid_corner_coordinates(num_patches_per_side):
     box_coordinates = np.stack(
-        np.meshgrid(np.arange(1, num_patches_per_side + 1), np.arange(1, num_patches_per_side + 1)), axis=-1
+        np.meshgrid(np.arange(1, num_patches_per_side + 1), np.arange(1, num_patches_per_side + 1)),
+        axis=-1,
     ).astype(np.float32)
     box_coordinates /= np.array([num_patches_per_side, num_patches_per_side], np.float32)
 
@@ -118,9 +116,7 @@ class OwlEncodeTextOutput:
     text_embeds: torch.Tensor
 
     def slice(self, start_index, end_index):
-        return OwlEncodeTextOutput(
-            text_embeds=self.text_embeds[start_index:end_index]
-        )
+        return OwlEncodeTextOutput(text_embeds=self.text_embeds[start_index:end_index])
 
 
 @dataclass
@@ -137,18 +133,20 @@ class OwlDecodeOutput:
     labels: torch.Tensor
     scores: torch.Tensor
     boxes: torch.Tensor
+    class_embeds: torch.Tensor
     input_indices: torch.Tensor
 
 
 class OwlPredictor(torch.nn.Module):
-    
-    def __init__(self,
-            model_name: str = "google/owlvit-base-patch32",
-            device: str = "cuda",
-            image_encoder_engine: Optional[str] = None,
-            image_encoder_engine_max_batch_size: int = 1,
-            image_preprocessor: Optional[ImagePreprocessor] = None
-        ):
+
+    def __init__(
+        self,
+        model_name: str = "google/owlvit-base-patch32",
+        device: str = "cuda",
+        image_encoder_engine: Optional[str] = None,
+        image_encoder_engine_max_batch_size: int = 1,
+        image_preprocessor: Optional[ImagePreprocessor] = None,
+    ):
 
         super().__init__()
 
@@ -159,39 +157,49 @@ class OwlPredictor(torch.nn.Module):
         self.patch_size = _owl_get_patch_size(model_name)
         self.num_patches_per_side = self.image_size // self.patch_size
         self.box_bias = _owl_compute_box_bias(self.num_patches_per_side).to(self.device)
-        self.num_patches = (self.num_patches_per_side)**2
-        self.mesh_grid = torch.stack(
-            torch.meshgrid(
-                torch.linspace(0., 1., self.image_size),
-                torch.linspace(0., 1., self.image_size)
+        self.num_patches = (self.num_patches_per_side) ** 2
+        self.mesh_grid = (
+            torch.stack(
+                torch.meshgrid(
+                    torch.linspace(0.0, 1.0, self.image_size),
+                    torch.linspace(0.0, 1.0, self.image_size),
+                )
             )
-        ).to(self.device).float()
+            .to(self.device)
+            .float()
+        )
         self.image_encoder_engine = None
         if image_encoder_engine is not None:
-            image_encoder_engine = OwlPredictor.load_image_encoder_engine(image_encoder_engine, image_encoder_engine_max_batch_size)
+            image_encoder_engine = OwlPredictor.load_image_encoder_engine(
+                image_encoder_engine, image_encoder_engine_max_batch_size
+            )
         self.image_encoder_engine = image_encoder_engine
-        self.image_preprocessor = image_preprocessor.to(self.device).eval() if image_preprocessor else ImagePreprocessor().to(self.device).eval()
+        self.image_preprocessor = (
+            image_preprocessor.to(self.device).eval()
+            if image_preprocessor
+            else ImagePreprocessor().to(self.device).eval()
+        )
 
     def get_num_patches(self):
         return self.num_patches
 
     def get_device(self):
         return self.device
-        
+
     def get_image_size(self):
         return (self.image_size, self.image_size)
-    
+
     def encode_text(self, text: List[str]) -> OwlEncodeTextOutput:
         text_input = self.processor(text=text, return_tensors="pt")
-        input_ids = text_input['input_ids'].to(self.device)
-        attention_mask = text_input['attention_mask'].to(self.device)
+        input_ids = text_input["input_ids"].to(self.device)
+        attention_mask = text_input["attention_mask"].to(self.device)
         text_outputs = self.model.owlvit.text_model(input_ids, attention_mask)
         text_embeds = text_outputs[1]
         text_embeds = self.model.owlvit.text_projection(text_embeds)
         return OwlEncodeTextOutput(text_embeds=text_embeds)
 
     def encode_image_torch(self, image: torch.Tensor) -> OwlEncodeImageOutput:
-        
+
         vision_outputs = self.model.owlvit.vision_model(image)
         last_hidden_state = vision_outputs[0]
         image_embeds = self.model.owlvit.vision_model.post_layernorm(last_hidden_state)
@@ -216,11 +224,11 @@ class OwlPredictor(torch.nn.Module):
             image_class_embeds=image_class_embeds,
             logit_shift=logit_shift,
             logit_scale=logit_scale,
-            pred_boxes=pred_boxes
+            pred_boxes=pred_boxes,
         )
 
         return output
-    
+
     def encode_image_trt(self, image: torch.Tensor) -> OwlEncodeImageOutput:
         return self.image_encoder_engine(image)
 
@@ -230,12 +238,18 @@ class OwlPredictor(torch.nn.Module):
         else:
             return self.encode_image_torch(image)
 
-    def extract_rois(self, image: torch.Tensor, rois: torch.Tensor, pad_square: bool = True, padding_scale: float = 1.0):
+    def extract_rois(
+        self,
+        image: torch.Tensor,
+        rois: torch.Tensor,
+        pad_square: bool = True,
+        padding_scale: float = 1.0,
+    ):
         if len(rois) == 0:
             return torch.empty(
                 (0, image.shape[1], self.image_size, self.image_size),
                 dtype=image.dtype,
-                device=image.device
+                device=image.device,
             )
         if pad_square:
             # pad square
@@ -244,25 +258,35 @@ class OwlPredictor(torch.nn.Module):
             cx = (rois[..., 0] + rois[..., 2]) / 2
             cy = (rois[..., 1] + rois[..., 3]) / 2
             s = torch.max(w, h)
-            rois = torch.stack([cx-s, cy-s, cx+s, cy+s], dim=-1)
+            rois = torch.stack([cx - s, cy - s, cx + s, cy + s], dim=-1)
 
             # compute mask
             pad_x = (s - w) / (2 * s)
             pad_y = (s - h) / (2 * s)
-            mask_x = (self.mesh_grid[1][None, ...] > pad_x[..., None, None]) & (self.mesh_grid[1][None, ...] < (1. - pad_x[..., None, None]))
-            mask_y = (self.mesh_grid[0][None, ...] > pad_y[..., None, None]) & (self.mesh_grid[0][None, ...] < (1. - pad_y[..., None, None]))
-            mask = (mask_x & mask_y)
+            mask_x = (self.mesh_grid[1][None, ...] > pad_x[..., None, None]) & (
+                self.mesh_grid[1][None, ...] < (1.0 - pad_x[..., None, None])
+            )
+            mask_y = (self.mesh_grid[0][None, ...] > pad_y[..., None, None]) & (
+                self.mesh_grid[0][None, ...] < (1.0 - pad_y[..., None, None])
+            )
+            mask = mask_x & mask_y
 
         # extract rois
         roi_images = roi_align(image, [rois], output_size=self.get_image_size())
 
         # mask rois
         if pad_square:
-            roi_images = (roi_images * mask[:, None, :, :])
+            roi_images = roi_images * mask[:, None, :, :]
 
         return roi_images, rois
-    
-    def encode_rois(self, image: torch.Tensor, rois: torch.Tensor, pad_square: bool = True, padding_scale: float=1.0):
+
+    def encode_rois(
+        self,
+        image: torch.Tensor,
+        rois: torch.Tensor,
+        pad_square: bool = True,
+        padding_scale: float = 1.0,
+    ):
         # with torch_timeit_sync("extract rois"):
         roi_images, rois = self.extract_rois(image, rois, pad_square, padding_scale)
         # with torch_timeit_sync("encode images"):
@@ -271,24 +295,29 @@ class OwlPredictor(torch.nn.Module):
         output.pred_boxes = pred_boxes
         return output
 
-    def decode(self, 
-            image_output: OwlEncodeImageOutput, 
-            text_output: OwlEncodeTextOutput,
-            threshold: Union[int, float, List[Union[int, float]]] = 0.1,
-        ) -> OwlDecodeOutput:
+    def decode(
+        self,
+        image_output: OwlEncodeImageOutput,
+        text_output: OwlEncodeTextOutput,
+        threshold: Union[int, float, List[Union[int, float]]] = 0.1,
+    ) -> OwlDecodeOutput:
 
         if isinstance(threshold, (int, float)):
-            threshold = [threshold] * len(text_output.text_embeds) #apply single threshold to all labels 
+            threshold = [threshold] * len(
+                text_output.text_embeds
+            )  # apply single threshold to all labels
 
         num_input_images = image_output.image_class_embeds.shape[0]
 
         image_class_embeds = image_output.image_class_embeds
-        image_class_embeds = image_class_embeds / (torch.linalg.norm(image_class_embeds, dim=-1, keepdim=True) + 1e-6)
+        image_class_embeds = image_class_embeds / (
+            torch.linalg.norm(image_class_embeds, dim=-1, keepdim=True) + 1e-6
+        )
         query_embeds = text_output.text_embeds
         query_embeds = query_embeds / (torch.linalg.norm(query_embeds, dim=-1, keepdim=True) + 1e-6)
         logits = torch.einsum("...pd,...qd->...pq", image_class_embeds, query_embeds)
         logits = (logits + image_output.logit_shift) * image_output.logit_scale
-        
+
         scores_sigmoid = torch.sigmoid(logits)
         scores_max = scores_sigmoid.max(dim=-1)
         labels = scores_max.indices
@@ -297,9 +326,9 @@ class OwlPredictor(torch.nn.Module):
         for i, thresh in enumerate(threshold):
             label_mask = labels == i
             score_mask = scores > thresh
-            obj_mask = torch.logical_and(label_mask,score_mask)
-            masks.append(obj_mask) 
-        
+            obj_mask = torch.logical_and(label_mask, score_mask)
+            masks.append(obj_mask)
+
         mask = masks[0]
         for mask_t in masks[1:]:
             mask = torch.logical_or(mask, mask_t)
@@ -311,7 +340,8 @@ class OwlPredictor(torch.nn.Module):
             labels=labels[mask],
             scores=scores[mask],
             boxes=image_output.pred_boxes[mask],
-            input_indices=input_indices[mask]
+            class_embeds=image_output.image_class_embeds[mask],
+            input_indices=input_indices[mask],
         )
 
     @staticmethod
@@ -320,27 +350,18 @@ class OwlPredictor(torch.nn.Module):
 
     @staticmethod
     def get_image_encoder_output_names():
-        names = [
-            "image_embeds",
-            "image_class_embeds",
-            "logit_shift",
-            "logit_scale",
-            "pred_boxes"
-        ]
+        names = ["image_embeds", "image_class_embeds", "logit_shift", "logit_scale", "pred_boxes"]
         return names
 
+    def export_image_encoder_onnx(
+        self, output_path: str, use_dynamic_axes: bool = True, batch_size: int = 1, onnx_opset=17
+    ):
 
-    def export_image_encoder_onnx(self, 
-            output_path: str,
-            use_dynamic_axes: bool = True,
-            batch_size: int = 1,
-            onnx_opset=17
-        ):
-        
         class TempModule(torch.nn.Module):
             def __init__(self, parent):
                 super().__init__()
                 self.parent = parent
+
             def forward(self, image):
                 output = self.parent.encode_image_torch(image)
                 return (
@@ -348,19 +369,19 @@ class OwlPredictor(torch.nn.Module):
                     output.image_class_embeds,
                     output.logit_shift,
                     output.logit_scale,
-                    output.pred_boxes
+                    output.pred_boxes,
                 )
 
         data = torch.randn(batch_size, 3, self.image_size, self.image_size).to(self.device)
 
         if use_dynamic_axes:
-            dynamic_axes =  {
+            dynamic_axes = {
                 "image": {0: "batch"},
                 "image_embeds": {0: "batch"},
                 "image_class_embeds": {0: "batch"},
                 "logit_shift": {0: "batch"},
                 "logit_scale": {0: "batch"},
-                "pred_boxes": {0: "batch"}       
+                "pred_boxes": {0: "batch"},
             }
         else:
             dynamic_axes = {}
@@ -368,29 +389,29 @@ class OwlPredictor(torch.nn.Module):
         model = TempModule(self)
 
         torch.onnx.export(
-            model, 
-            data, 
-            output_path, 
-            input_names=self.get_image_encoder_input_names(), 
+            model,
+            data,
+            output_path,
+            input_names=self.get_image_encoder_input_names(),
             output_names=self.get_image_encoder_output_names(),
             dynamic_axes=dynamic_axes,
-            opset_version=onnx_opset
+            opset_version=onnx_opset,
         )
-    
+
     @staticmethod
     def load_image_encoder_engine(engine_path: str, max_batch_size: int = 1):
         import tensorrt as trt
         from torch2trt import TRTModule
 
         with trt.Logger() as logger, trt.Runtime(logger) as runtime:
-            with open(engine_path, 'rb') as f:
+            with open(engine_path, "rb") as f:
                 engine_bytes = f.read()
             engine = runtime.deserialize_cuda_engine(engine_bytes)
 
         base_module = TRTModule(
             engine,
             input_names=OwlPredictor.get_image_encoder_input_names(),
-            output_names=OwlPredictor.get_image_encoder_output_names()
+            output_names=OwlPredictor.get_image_encoder_output_names(),
         )
 
         class Wrapper(torch.nn.Module):
@@ -411,29 +432,28 @@ class OwlPredictor(torch.nn.Module):
                     image_slice = image[start_index:end_index]
                     # with torch_timeit_sync("run_engine"):
                     output = self.base_module(image_slice)
-                    results.append(
-                        output
-                    )
+                    results.append(output)
 
                 return OwlEncodeImageOutput(
                     image_embeds=torch.cat([r[0] for r in results], dim=0),
                     image_class_embeds=torch.cat([r[1] for r in results], dim=0),
                     logit_shift=torch.cat([r[2] for r in results], dim=0),
                     logit_scale=torch.cat([r[3] for r in results], dim=0),
-                    pred_boxes=torch.cat([r[4] for r in results], dim=0)
+                    pred_boxes=torch.cat([r[4] for r in results], dim=0),
                 )
 
         image_encoder = Wrapper(base_module, max_batch_size)
 
         return image_encoder
 
-    def build_image_encoder_engine(self, 
-            engine_path: str, 
-            max_batch_size: int = 1, 
-            fp16_mode = True, 
-            onnx_path: Optional[str] = None,
-            onnx_opset: int = 17
-        ):
+    def build_image_encoder_engine(
+        self,
+        engine_path: str,
+        max_batch_size: int = 1,
+        fp16_mode=True,
+        onnx_path: Optional[str] = None,
+        onnx_opset: int = 17,
+    ):
 
         if onnx_path is None:
             onnx_dir = tempfile.mkdtemp()
@@ -441,7 +461,7 @@ class OwlPredictor(torch.nn.Module):
             self.export_image_encoder_onnx(onnx_path, onnx_opset=onnx_opset)
 
         args = ["/usr/src/tensorrt/bin/trtexec"]
-    
+
         args.append(f"--onnx={onnx_path}")
         args.append(f"--saveEngine={engine_path}")
 
@@ -454,23 +474,28 @@ class OwlPredictor(torch.nn.Module):
 
         return self.load_image_encoder_engine(engine_path, max_batch_size)
 
-    def predict(self, 
-            image: PIL.Image, 
-            text: List[str], 
-            text_encodings: Optional[OwlEncodeTextOutput],
-            threshold: Union[int, float, List[Union[int, float]]] = 0.1,
-            pad_square: bool = True,
-            
-        ) -> OwlDecodeOutput:
+    def predict(
+        self,
+        image: PIL.Image,
+        text: List[str],
+        text_encodings: Optional[OwlEncodeTextOutput],
+        threshold: Union[int, float, List[Union[int, float]]] = 0.1,
+        pad_square: bool = True,
+    ) -> OwlDecodeOutput:
 
         image_tensor = self.image_preprocessor.preprocess_pil_image(image)
 
         if text_encodings is None:
             text_encodings = self.encode_text(text)
 
-        rois = torch.tensor([[0, 0, image.width, image.height]], dtype=image_tensor.dtype, device=image_tensor.device)
+        rois = torch.tensor(
+            [[0, 0, image.width, image.height]],
+            dtype=image_tensor.dtype,
+            device=image_tensor.device,
+        )
 
         image_encodings = self.encode_rois(image_tensor, rois, pad_square=pad_square)
 
         return self.decode(image_encodings, text_encodings, threshold)
 
+        return self.decode(image_encodings, text_encodings, threshold)
